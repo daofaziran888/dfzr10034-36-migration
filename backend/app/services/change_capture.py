@@ -1,12 +1,17 @@
 """变更捕获领域服务：Schema和元数据的变更捕获、版本对比和差异通知。
 
 Pipeline 6: Change capture → diff reporting → version history
+
+采集侧支持带类型的字段映射：before/after 以字段名为键，值的真实类型
+即采集类型（整数 7 与文本 "7" 落库后依然可分），某侧缺少的键视为缺列。
 """
 from __future__ import annotations
 
+import json
 import time as _time
 from typing import Any
 
+from app.diff_types import TYPE_MISSING, typed_value
 from app.services.base import BaseModuleService
 from app.store import store
 
@@ -65,6 +70,80 @@ class ChangeCaptureService(BaseModuleService):
         return {
             "change": change,
             "diff_report": diff_result,
+            "version_snapshot": version_snap,
+            "affected_downstream": affected_downstream,
+            "pipeline": "change_capture->diff_report->version_history",
+        }
+
+    def capture_typed_change(self, asset_code: str, change_type: str,
+                             before_map: dict[str, Any] | None,
+                             after_map: dict[str, Any] | None,
+                             source: str = "typed_collection") -> dict[str, Any]:
+        """捕获带类型映射的变更：按字段逐一生成带类型的差异记录。
+
+        before_map/after_map 的键是字段名，值的真实类型即采集类型；
+        某侧缺少的键视为缺列（missing），不与空值、文本零混淆。
+        """
+        from app.services.diff_report import DiffReportService  # 延迟导入，同 schedule_job
+
+        before_typed = {k: typed_value(v) for k, v in (before_map or {}).items()}
+        after_typed = {k: typed_value(v) for k, v in (after_map or {}).items()}
+
+        change_id = store.next_id(self.MODULE)
+        change = {
+            "id": change_id,
+            "记录编号": f"CHAN-{change_id:04d}",
+            "目标资产": asset_code,
+            "变更类型": change_type,
+            "变更前值": json.dumps({k: v["text"] for k, v in before_typed.items()}, ensure_ascii=False),
+            "变更后值": json.dumps({k: v["text"] for k, v in after_typed.items()}, ensure_ascii=False),
+            "变更前值类型映射": before_typed,
+            "变更后值类型映射": after_typed,
+            "变更来源": source,
+            "变更时间": _time.strftime("%Y-%m-%d %H:%M:%S"),
+            "影响范围": self._compute_impact_scope(asset_code, change_type),
+            "status": "已捕获",
+            "pending": True,
+            "abnormal": False,
+            "created_at": _time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        store.rows(self.MODULE).append(change)
+
+        # Pipeline 6（类型化）：逐字段生成带类型映射的差异记录
+        diff_service = DiffReportService()
+        fields = list(dict.fromkeys([*before_typed.keys(), *after_typed.keys()]))
+        diff_reports = []
+        for field in fields:
+            from_typed = before_typed.get(field) or typed_value(None, missing=True)
+            to_typed = after_typed.get(field) or typed_value(None, missing=True)
+            level = "修改"
+            if from_typed["type"] == TYPE_MISSING:
+                level = "新增"
+            elif to_typed["type"] == TYPE_MISSING:
+                level = "删除"
+            diff_reports.append(diff_service.generate_typed_report(
+                asset_code, change_type, field, from_typed, to_typed, level=level))
+
+        version_snap = self._create_version_snapshot(change)
+        affected_downstream = self._find_downstream_assets(asset_code)
+
+        store.log_change(
+            self.MODULE, change_id, "变更捕获完成",
+            before=change_type, after=f"差异{len(diff_reports)}条，影响{len(affected_downstream)}个下游",
+            source="pipeline_6", scope="change_capture->diff_report->version_history"
+        )
+
+        self.emit_event("change_captured", {
+            "change_id": change_id,
+            "asset_code": asset_code,
+            "change_type": change_type,
+            "typed": True,
+            "downstream_count": len(affected_downstream),
+        })
+
+        return {
+            "change": change,
+            "diff_reports": diff_reports,
             "version_snapshot": version_snap,
             "affected_downstream": affected_downstream,
             "pipeline": "change_capture->diff_report->version_history",
